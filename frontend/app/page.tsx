@@ -9,6 +9,7 @@ import { AutoApplyStep } from "@/components/steps/AutoApplyStep";
 import { LandingFooter } from "@/components/landing/LandingFooter";
 import { PhoneMockup } from "@/components/landing/PhoneMockup";
 import {
+  API_URL,
   checkBackendHealth,
   getJobSources,
   type CandidateProfile,
@@ -61,6 +62,10 @@ export default function HomePage() {
   const [profile, setProfile] = useState<CandidateProfile | null>(null);
   const [jobSources, setJobSources] = useState<JobSource[]>([]);
   const [error, setError] = useState("");
+  const [health, setHealth] = useState<"checking" | "ok" | "error">("checking");
+  const [healthDetail, setHealthDetail] = useState("");
+  const [healthElapsed, setHealthElapsed] = useState(0);
+  const [healthRun, setHealthRun] = useState(0);
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
   const [selectedPlatforms, setSelectedPlatforms] = useState<string[]>(["linkedin"]);
@@ -88,12 +93,36 @@ export default function HomePage() {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    void checkBackendHealth()
+    let cancelled = false;
+    setHealth("checking");
+    setHealthDetail("");
+    setHealthElapsed(0);
+    const startedAt = Date.now();
+    const ticker = window.setInterval(() => {
+      if (!cancelled) setHealthElapsed(Math.floor((Date.now() - startedAt) / 1000));
+    }, 1000);
+    checkBackendHealth()
       .then((ok) => {
-        if (!ok) setError(`Backend health check failed`);
+        if (cancelled) return;
+        setHealth(ok ? "ok" : "error");
+        if (!ok) {
+          setHealthDetail(`No healthy response from ${API_URL}/health`);
+          return;
+        }
+        void getJobSources()
+          .then((r) => {
+            if (!cancelled) setJobSources(r.sources);
+          })
+          .catch(() => {});
       })
-      .catch(() => setError("Backend unreachable"));
-    void getJobSources().then((r) => setJobSources(r.sources)).catch(() => {});
+      .catch((err) => {
+        if (cancelled) return;
+        setHealth("error");
+        setHealthDetail(err instanceof Error ? err.message : "Backend unreachable");
+      })
+      .finally(() => {
+        if (!cancelled) window.clearInterval(ticker);
+      });
     // Never auto-skip the upload step — just remember the previous profile
     // so the user can continue or start fresh.
     const stored = window.localStorage.getItem("candidateId");
@@ -103,7 +132,11 @@ export default function HomePage() {
         setStoredId(id);
       }
     }
-  }, []);
+    return () => {
+      cancelled = true;
+      window.clearInterval(ticker);
+    };
+  }, [healthRun]);
 
   const handleUploadComplete = (id: number, candidateProfile: CandidateProfile) => {
     setCandidateId(id);
@@ -391,6 +424,34 @@ export default function HomePage() {
           </div>
 
           {message && <div className="alert-success mt-6">{message}</div>}
+          {health === "checking" && (
+            <div className="alert-info mt-6">
+              Connecting to the backend — free-tier instances sleep after ~15 min of
+              inactivity, and waking one can take a few minutes
+              {healthElapsed > 0 ? ` (${healthElapsed}s elapsed)` : ""}. This happens
+              automatically.
+            </div>
+          )}
+          {health === "error" && (
+            <div className="alert-info mt-6">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <span>
+                  The backend has not answered yet — it is most likely still waking up
+                  from a cold start. You can keep waiting or check again.
+                </span>
+                <button
+                  type="button"
+                  className="btn-outline"
+                  onClick={() => setHealthRun((n) => n + 1)}
+                >
+                  Check again
+                </button>
+              </div>
+              {healthDetail && (
+                <p className="mt-2 break-all text-xs opacity-70">{healthDetail}</p>
+              )}
+            </div>
+          )}
           {error && <div className="alert-error mt-6">{error}</div>}
 
           {!candidateId && storedId && step === "upload" && (

@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 from pydantic import AliasChoices, Field
@@ -15,6 +16,15 @@ def parse_cors_origins(raw: str) -> list[str]:
         parsed = json.loads(value)
         return [str(v).strip() for v in parsed if str(v).strip()]
     return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def origins_to_regex(patterns: list[str]) -> re.Pattern[str] | None:
+    """Compile `*` glob patterns (e.g. https://*.vercel.app) into an origin regex."""
+    wildcards = [p for p in patterns if "*" in p]
+    if not wildcards:
+        return None
+    joined = "|".join(re.escape(p).replace(r"\*", ".*") for p in wildcards)
+    return re.compile(f"^(?:{joined})$")
 
 
 class Settings(BaseSettings):
@@ -56,10 +66,31 @@ class Settings(BaseSettings):
         default="http://localhost:3000",
         validation_alias=AliasChoices("CORS_ORIGINS", "ALLOWED_ORIGINS"),
     )
+    # Glob patterns for origins whose host changes (Vercel preview/alias domains).
+    allowed_origin_patterns: str = Field(
+        default="https://*.vercel.app,http://localhost:*",
+        validation_alias=AliasChoices("CORS_ORIGIN_PATTERNS", "ALLOWED_ORIGIN_PATTERNS"),
+    )
 
     @property
     def cors_origin_list(self) -> list[str]:
         return parse_cors_origins(self.allowed_origins)
+
+    @property
+    def cors_pattern_list(self) -> list[str]:
+        return parse_cors_origins(self.allowed_origin_patterns)
+
+    @property
+    def cors_origin_regex(self) -> re.Pattern[str] | None:
+        return origins_to_regex(self.cors_pattern_list)
+
+    def cors_origin_allowed(self, origin: str | None) -> bool:
+        if not origin:
+            return False
+        if origin in self.cors_origin_list:
+            return True
+        pattern = self.cors_origin_regex
+        return bool(pattern and pattern.match(origin))
 
     @property
     def use_embedding_fallback(self) -> bool:

@@ -23,6 +23,7 @@ app.add_middleware(RequestLoggingMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
+    allow_origin_regex=settings.cors_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -110,6 +111,7 @@ def health() -> dict:
         "build": "2026-10-03.13",
         "embedding_fallback": settings.use_embedding_fallback,
         "cors_origins": settings.cors_origin_list,
+        "cors_patterns": settings.cors_pattern_list,
         "disk": _disk_info(),
         "routes": [
             "/api/resumes/upload",
@@ -125,7 +127,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
     logger.exception("Unhandled error on %s %s", request.method, request.url.path)
     response = JSONResponse(status_code=500, content={"detail": "Internal server error"})
     origin = request.headers.get("origin")
-    if origin and origin in settings.cors_origin_list:
+    if settings.cors_origin_allowed(origin):
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
     return response

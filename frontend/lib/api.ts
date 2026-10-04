@@ -4,7 +4,8 @@ export const API_URL = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:800
 );
 
 const RETRYABLE_STATUS = new Set([502, 503, 504]);
-const RETRY_PAUSES_MS = [6_000, 12_000, 24_000];
+const MAX_FETCH_ATTEMPTS = 30;
+const RETRY_PAUSES_MS = [6_000, 12_000, 24_000, 30_000];
 
 class ApiError extends Error {}
 
@@ -12,15 +13,30 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function apiFetch(path: string, init?: RequestInit, timeoutMs = 120_000): Promise<Response> {
+async function apiFetch(
+  path: string,
+  init?: RequestInit,
+  timeoutMs = 120_000,
+  budgetMs?: number,
+  pausesMs: number[] = RETRY_PAUSES_MS,
+): Promise<Response> {
+  const deadline = Date.now() + (budgetMs ?? timeoutMs);
   let lastError: Error | undefined;
 
-  for (let attempt = 0; attempt <= RETRY_PAUSES_MS.length; attempt += 1) {
+  // Budget-driven, not attempt-driven: a cold start can reject or hang for minutes,
+  // so keep probing until the budget runs out (escalating pause, capped at its last step).
+  for (let attempt = 0; attempt < MAX_FETCH_ATTEMPTS; attempt += 1) {
+    const minAttemptMs = Math.min(timeoutMs, 15_000);
+    const remainingBefore = deadline - Date.now();
+    if (remainingBefore <= minAttemptMs) break;
     if (attempt > 0) {
-      await sleep(RETRY_PAUSES_MS[attempt - 1]);
+      const pause = pausesMs[Math.min(attempt - 1, pausesMs.length - 1)];
+      await sleep(Math.min(pause, remainingBefore - minAttemptMs));
     }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const timer = setTimeout(() => controller.abort(), Math.min(timeoutMs, remaining));
 
     try {
       const res = await fetch(`${API_URL}${path}`, {
@@ -30,7 +46,7 @@ async function apiFetch(path: string, init?: RequestInit, timeoutMs = 120_000): 
       if (RETRYABLE_STATUS.has(res.status)) {
         // Backend unreachable / Render cold start — request was not processed.
         lastError = new Error(
-          `Backend unavailable (${res.status}) — waiting for it to come up (attempt ${attempt + 1}/${RETRY_PAUSES_MS.length + 1})…`,
+          `Backend unavailable (${res.status}) — waiting for it to come up (attempt ${attempt + 1})…`,
         );
         continue;
       }
@@ -48,13 +64,16 @@ async function apiFetch(path: string, init?: RequestInit, timeoutMs = 120_000): 
         throw err;
       }
       if (err instanceof Error && err.name === "AbortError") {
-        throw new Error(
-          `Request timed out after ${timeoutMs / 1000}s. The backend may be waking up (free tier) — please wait a minute and retry.`,
+        // Timeout during a Render cold start — the connection is held while the
+        // instance boots, so retry within the budget instead of failing outright.
+        lastError = new Error(
+          `No response after ${timeoutMs / 1000}s (attempt ${attempt + 1}) — the backend may still be waking up from a cold start.`,
         );
+        continue;
       }
       // Network-level failure (backend down or cold starting) — safe to retry.
       lastError = new Error(
-        `Cannot connect to backend at ${API_URL} (retried ${attempt + 1}/${RETRY_PAUSES_MS.length + 1}×). The server may be waking up — if this keeps happening, check ${API_URL}/health.`,
+        `Cannot connect to backend at ${API_URL} (attempt ${attempt + 1}). The server may be waking up — if this keeps happening, check ${API_URL}/health.`,
       );
     } finally {
       clearTimeout(timer);
@@ -69,11 +88,13 @@ async function apiFetchWithRetry(
   init?: RequestInit,
   timeoutMs = 120_000,
   retries = 2,
+  budgetMs?: number,
+  pausesMs?: number[],
 ): Promise<Response> {
   let lastError: Error | undefined;
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     try {
-      return await apiFetch(path, init, timeoutMs);
+      return await apiFetch(path, init, timeoutMs, budgetMs, pausesMs);
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
       if (attempt < retries) {
@@ -169,8 +190,22 @@ export function logClick(
   }, 10_000).catch(() => {});
 }
 
+// Render free tier sleeps after ~15 min idle. Measured cold starts hold the first
+// request open for minutes (337s in our test) before the instance answers, so the
+// health probe gets an 8-minute budget with escalating pauses: a cold start must
+// read as "still waking up", never as "Backend unreachable".
+export const HEALTH_BUDGET_MS = 480_000;
+const HEALTH_TIMEOUT_MS = 30_000;
+const HEALTH_PAUSES_MS = [10_000, 15_000, 25_000, 40_000, 60_000, 90_000];
+
 export async function checkBackendHealth(): Promise<boolean> {
-  const res = await apiFetchWithRetry("/health", undefined, 20_000, 0);
+  const res = await apiFetch(
+    "/health",
+    undefined,
+    HEALTH_TIMEOUT_MS,
+    HEALTH_BUDGET_MS,
+    HEALTH_PAUSES_MS,
+  );
   return res.ok;
 }
 
@@ -199,7 +234,7 @@ export async function uploadResume(file: File) {
 }
 
 export async function getJobSources() {
-  const res = await apiFetchWithRetry("/api/jobs/sources", undefined, 20_000, 0);
+  const res = await apiFetchWithRetry("/api/jobs/sources", undefined, 20_000, 0, 90_000);
   if (!res.ok) throw new Error(await res.text());
   return res.json() as Promise<{ sources: JobSource[] }>;
 }
